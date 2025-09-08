@@ -1,12 +1,15 @@
-// lib/main.dart — Multipeer + Mesh entegrasyonu (izin + kalıcı deviceId + init)
+// lib/main.dart — Multipeer + Mesh entegrasyonu (izin + kalıcı deviceId + init + UI state)
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
 import 'multipeer_service.dart';
 import 'mesh/mesh_service.dart'; // yolun doğruysa bırak, değilse 'mesh/mesh_service.dart'
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 void main() {
   runApp(const MyApp());
 }
@@ -36,6 +39,9 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  // MethodChannel (doğrudan native method'ları çağırmak için)
+  static const MethodChannel _methodChannel = MethodChannel('com.example.multipeer/methods');
+
   List<Peer> discoveredPeers = [];
   String? connectedPeerId;
   final TextEditingController _messageController = TextEditingController();
@@ -48,6 +54,12 @@ class _HomePageState extends State<HomePage> {
   late String _localName;
 
   bool _initializing = true;
+
+  // UI state flags to prevent double start
+  bool _isAdvertising = false;
+  bool _isBrowsing = false;
+
+  bool _buttonLocked = false;
 
   @override
   void initState() {
@@ -122,7 +134,6 @@ class _HomePageState extends State<HomePage> {
 
     final statuses = await permissions.request();
 
-    // On Android 12+, some permissions might be unavailable on older devices; treat them as granted if not applicable
     bool allGranted = true;
     for (final perm in permissions) {
       final status = statuses[perm];
@@ -159,6 +170,7 @@ class _HomePageState extends State<HomePage> {
   void _startListening() {
     // Listen native transport events (peerFound, peerLost, connectionState, dataReceived, error)
     _eventSub = MultipeerService.events.listen((evt) {
+      debugPrint('Event: $evt');
       final type = evt['event'] as String? ?? '';
 
       if (type == 'peerFound') {
@@ -188,8 +200,36 @@ class _HomePageState extends State<HomePage> {
           ScaffoldMessenger.of(context)
               .showSnackBar(SnackBar(content: Text('Raw transport: $msg')));
         }
+      } else if (type == 'advertisingStarted') {
+        setState(() {
+          _isAdvertising = true;
+        });
+        _showStatus('Advertise started');
+      } else if (type == 'browsingStarted') {
+        setState(() {
+          _isBrowsing = true;
+        });
+        _showStatus('Browsing started');
+      } else if (type == 'advertisingStopped') {
+        setState(() {
+          _isAdvertising = false;
+        });
+      } else if (type == 'browsingStopped') {
+        setState(() {
+          _isBrowsing = false;
+        });
+      } else if (type == 'invitationSent') {
+        _showStatus('Davet gönderildi');
+      } else if (type == 'invitationReceived') {
+        _showStatus('Davet alındı: ${evt['displayName'] ?? evt['peerId']}');
       } else if (type == 'error') {
         final message = evt['message'] as String? ?? 'Unknown';
+        // map Nearby-specific codes to flags if necessary
+        if (message.contains('ALREADY_ADVERTISING') || message.contains('STATUS_ALREADY_ADVERTISING')) {
+          setState(() { _isAdvertising = true; });
+        } else if (message.contains('ALREADY_DISCOVERING') || message.contains('STATUS_ALREADY_DISCOVERING')) {
+          setState(() { _isBrowsing = true; });
+        }
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Hata: $message')));
       }
@@ -198,21 +238,53 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  void _lockButtonTemporarily() {
+    setState(() => _buttonLocked = true);
+    Future.delayed(const Duration(seconds: 1), () {
+      if (mounted) setState(() => _buttonLocked = false);
+    });
+  }
+
   Future<void> _startAdvertising() async {
+    if (_isAdvertising || _buttonLocked) {
+      _showStatus('Zaten görünürsün veya işlem bekliyor.');
+      return;
+    }
+    _lockButtonTemporarily();
+    setState(() => _isAdvertising = true); // optimistic UI
     try {
-      await MultipeerService.startAdvertising(displayName: _localName, serviceType: 'mpconn');
-      _showStatus('Advertise started');
+      await _methodChannel.invokeMethod('startAdvertising', {'displayName': _localName, 'serviceType': 'mpconn'});
+      // actual started event handled via EventChannel
     } catch (e) {
+      setState(() => _isAdvertising = false);
       _showStatus('Advertise error: $e');
     }
   }
 
   Future<void> _startBrowsing() async {
+    if (_isBrowsing || _buttonLocked) return;
+    _lockButtonTemporarily();
+    setState(() => _isBrowsing = true);
     try {
-      await MultipeerService.startBrowsing(displayName: _localName, serviceType: 'mpconn');
-      _showStatus('Browsing started');
+      await _methodChannel.invokeMethod('startBrowsing', {'displayName': _localName, 'serviceType': 'mpconn'});
     } catch (e) {
+      setState(() => _isBrowsing = false);
       _showStatus('Browsing error: $e');
+    }
+  }
+
+  Future<void> _startBoth() async {
+    if (_isAdvertising || _isBrowsing || _buttonLocked) {
+      _showStatus('Zaten bir işlem çalışıyor.');
+      return;
+    }
+    _lockButtonTemporarily();
+    setState(() { _isAdvertising = true; _isBrowsing = true; });
+    try {
+      await _methodChannel.invokeMethod('startBoth', {'displayName': _localName, 'serviceType': 'mpconn'});
+    } catch (e) {
+      setState(() { _isAdvertising = false; _isBrowsing = false; });
+      _showStatus('Both start error: $e');
     }
   }
 
@@ -258,8 +330,18 @@ class _HomePageState extends State<HomePage> {
             ? const Center(child: CircularProgressIndicator())
             : Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                 Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-                  ElevatedButton(onPressed: _startAdvertising, child: const Text('Görünür Ol (Host)')),
-                  ElevatedButton(onPressed: _startBrowsing, child: const Text('Cihaz Ara (Guest)')),
+                  ElevatedButton(
+                    onPressed: _isAdvertising || _buttonLocked ? null : _startAdvertising,
+                    child: const Text('Görünür Ol (Host)'),
+                  ),
+                  ElevatedButton(
+                    onPressed: _isBrowsing || _buttonLocked ? null : _startBrowsing,
+                    child: const Text('Cihaz Ara (Guest)'),
+                  ),
+                  ElevatedButton(
+                    onPressed: (_isAdvertising || _isBrowsing || _buttonLocked) ? null : _startBoth,
+                    child: const Text('Hem Ara Hem Görünür Ol'),
+                  ),
                 ]),
                 const SizedBox(height: 20),
                 Text(
