@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
 import 'multipeer_service.dart';
-import 'mesh/mesh_service.dart'; // yolun doğruysa bırak, değilse 'mesh/mesh_service.dart'
+import 'mesh/mesh_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -39,7 +39,6 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  // MethodChannel (doğrudan native method'ları çağırmak için)
   static const MethodChannel _methodChannel = MethodChannel('com.example.multipeer/methods');
 
   List<Peer> discoveredPeers = [];
@@ -49,16 +48,12 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<Map<String, dynamic>>? _eventSub;
   StreamSubscription<Map<String, dynamic>>? _meshSub;
 
-  // local identity used for MeshService (persistent)
   late String _localId;
   late String _localName;
 
   bool _initializing = true;
-
-  // UI state flags to prevent double start
   bool _isAdvertising = false;
   bool _isBrowsing = false;
-
   bool _buttonLocked = false;
 
   @override
@@ -67,83 +62,103 @@ class _HomePageState extends State<HomePage> {
     _bootstrap();
   }
 
+
   Future<void> _bootstrap() async {
-    // 1) request runtime permissions
-    final ok = await _requestRequiredPermissions();
-    if (!ok) {
-      // kullanıcı izin vermediyse, uyar ve Settings'e yönlendir
-      if (!mounted) return;
-      await showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('İzin gerekli'),
-          content: const Text(
-              'Uygulamanın yakın cihaz keşfi yapabilmesi için Bluetooth ve konum izinlerine ihtiyaç var. Lütfen izin verin.'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Tamam'),
-            ),
-            TextButton(
-              onPressed: () {
-                openAppSettings();
-                Navigator.of(ctx).pop();
-              },
-              child: const Text('Ayarlar'),
-            ),
-          ],
-        ),
-      );
-      // izin yoksa devam etmiyoruz
+    setState(() => _initializing = true);
+
+    // 1. İzinleri kontrol et ve iste
+    final permissionsGranted = await _requestAndValidatePermissions();
+    if (!permissionsGranted) {
+      // İzinler verilmediyse, hiçbir şey başlatma ve durumu kullanıcıya bildir.
+      if (mounted) _showStatus('Gerekli izinler verilmedi. Uygulama çalışamaz.');
       setState(() => _initializing = false);
       return;
     }
-
-    // 2) get or create persistent device id
+    
+    // İzinler tamsa, devam et
     _localId = await _getOrCreateDeviceId();
     _localName = 'Device-${_localId.substring(0, 6)}';
 
-    // 3) init MeshService (it will subscribe to Multipeer transport events internally)
     try {
       await MeshService().init(deviceId: _localId, deviceName: _localName);
       _meshSub = MeshService().onMessage.listen((msg) {
         final payload = msg['payload'] as String? ?? '';
-        if (!mounted) return;
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Mesh gelen: $payload')));
+        if (mounted) {
+          _showStatus('Mesh gelen: $payload');
+        }
       });
     } catch (e) {
       debugPrint('Mesh init error: $e');
     }
 
-    // 4) start listening transport events
     _startListening();
-
     setState(() => _initializing = false);
   }
 
+   Future<bool> _requestAndValidatePermissions() async {
+    final permissions = [
+      Permission.location,
+      Permission.bluetoothScan,
+      Permission.bluetoothAdvertise,
+      Permission.bluetoothConnect,
+    ];
+
+    for (final permission in permissions) {
+      final status = await permission.status;
+      if (status.isDenied) {
+        // İzin daha önce istenmemiş veya reddedilmiş, tekrar iste.
+        final newStatus = await permission.request();
+        if (!newStatus.isGranted) {
+          // Kullanıcı yine reddetti.
+          if(await permission.isPermanentlyDenied && mounted){
+             // Kalıcı olarak reddetti, ayarlara yönlendir.
+             await _showPermissionPermanentlyDeniedDialog();
+          }
+          return false;
+        }
+      } else if (status.isPermanentlyDenied) {
+        // Kullanıcı kalıcı olarak reddetmiş, ayarlara yönlendirmeliyiz.
+        if (mounted) await _showPermissionPermanentlyDeniedDialog();
+        return false;
+      }
+    }
+    
+    // Buraya geldiyse tüm izinler verilmiştir.
+    return true;
+  }
+
+
+Future<void> _showPermissionPermanentlyDeniedDialog() async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('İzin Gerekli'),
+        content: const Text(
+            'Yakındaki cihazları bulabilmek için Konum ve Bluetooth izinlerini vermeniz zorunludur. Ayarları açıp izinleri manuel olarak verebilirsiniz.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Vazgeç')),
+          TextButton(
+            onPressed: () {
+              openAppSettings(); // permission_handler paketi bu fonksiyonu sağlar.
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('Ayarları Aç'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<bool> _requestRequiredPermissions() async {
-    // Compose list depending on platform; permission_handler maps to Android fine
     final permissions = <Permission>[
       Permission.bluetooth,
       Permission.bluetoothScan,
       Permission.bluetoothAdvertise,
       Permission.bluetoothConnect,
-      Permission.location, // ACCESS_FINE_LOCATION needed for Wi-Fi/Bluetooth discovery on many devices
+      Permission.location,
     ];
-
     final statuses = await permissions.request();
-
-    bool allGranted = true;
-    for (final perm in permissions) {
-      final status = statuses[perm];
-      if (status == null) continue; // not supported on platform/version
-      if (!status.isGranted) {
-        allGranted = false;
-        break;
-      }
-    }
-    return allGranted;
+    return statuses.values.every((status) => status.isGranted);
   }
 
   Future<String> _getOrCreateDeviceId() async {
@@ -168,70 +183,67 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _startListening() {
-    // Listen native transport events (peerFound, peerLost, connectionState, dataReceived, error)
     _eventSub = MultipeerService.events.listen((evt) {
       debugPrint('Event: $evt');
       final type = evt['event'] as String? ?? '';
-
-      if (type == 'peerFound') {
-        final id = evt['peerId'] as String? ?? '';
-        final name = evt['displayName'] as String? ?? id;
-        if (!discoveredPeers.any((p) => p.id == id)) {
-          setState(() => discoveredPeers.add(Peer(id: id, name: name)));
-        }
-      } else if (type == 'peerLost') {
-        final id = evt['peerId'] as String? ?? '';
-        setState(() => discoveredPeers.removeWhere((p) => p.id == id));
-      } else if (type == 'connectionState') {
-        final state = evt['state'] as String? ?? '';
-        final id = evt['peerId'] as String?;
-        if (state == 'connected' && id != null) {
-          setState(() => connectedPeerId = id);
-        } else if (state == 'notConnected' && id != null) {
-          if (connectedPeerId == id) setState(() => connectedPeerId = null);
-        }
-      } else if (type == 'dataReceived') {
-        // Debug/legacy raw transport messages (MeshService already handles forwarding)
-        final List<dynamic>? arr = evt['data'] as List<dynamic>?;
-        if (arr != null) {
-          final bytes = Uint8List.fromList(arr.cast<int>());
-          final msg = String.fromCharCodes(bytes);
-          if (!mounted) return;
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text('Raw transport: $msg')));
-        }
-      } else if (type == 'advertisingStarted') {
-        setState(() {
-          _isAdvertising = true;
-        });
-        _showStatus('Advertise started');
-      } else if (type == 'browsingStarted') {
-        setState(() {
-          _isBrowsing = true;
-        });
-        _showStatus('Browsing started');
-      } else if (type == 'advertisingStopped') {
-        setState(() {
-          _isAdvertising = false;
-        });
-      } else if (type == 'browsingStopped') {
-        setState(() {
-          _isBrowsing = false;
-        });
-      } else if (type == 'invitationSent') {
-        _showStatus('Davet gönderildi');
-      } else if (type == 'invitationReceived') {
-        _showStatus('Davet alındı: ${evt['displayName'] ?? evt['peerId']}');
-      } else if (type == 'error') {
-        final message = evt['message'] as String? ?? 'Unknown';
-        // map Nearby-specific codes to flags if necessary
-        if (message.contains('ALREADY_ADVERTISING') || message.contains('STATUS_ALREADY_ADVERTISING')) {
-          setState(() { _isAdvertising = true; });
-        } else if (message.contains('ALREADY_DISCOVERING') || message.contains('STATUS_ALREADY_DISCOVERING')) {
-          setState(() { _isBrowsing = true; });
-        }
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Hata: $message')));
+      
+      switch (type) {
+        case 'peerFound':
+          final id = evt['peerId'] as String? ?? '';
+          final name = evt['displayName'] as String? ?? id;
+          if (!discoveredPeers.any((p) => p.id == id)) {
+            setState(() => discoveredPeers.add(Peer(id: id, name: name)));
+          }
+          break;
+        case 'peerLost':
+          final id = evt['peerId'] as String? ?? '';
+          setState(() => discoveredPeers.removeWhere((p) => p.id == id));
+          break;
+        case 'connectionState':
+          final state = evt['state'] as String? ?? '';
+          final id = evt['peerId'] as String?;
+          if (state == 'connected' && id != null) {
+            setState(() => connectedPeerId = id);
+          } else if (state == 'notConnected' && id != null) {
+            if (connectedPeerId == id) setState(() => connectedPeerId = null);
+          }
+          break;
+        case 'dataReceived':
+          final List<dynamic>? arr = evt['data'] as List<dynamic>?;
+          if (arr != null) {
+            final bytes = Uint8List.fromList(arr.cast<int>());
+            final msg = String.fromCharCodes(bytes);
+            if (mounted) _showStatus('Raw transport: $msg');
+          }
+          break;
+        case 'advertisingStarted':
+          setState(() => _isAdvertising = true);
+          _showStatus('Advertise started');
+          break;
+        case 'browsingStarted':
+          setState(() => _isBrowsing = true);
+          _showStatus('Browsing started');
+          break;
+        case 'advertisingStopped':
+          setState(() => _isAdvertising = false);
+          break;
+        case 'browsingStopped':
+          setState(() => _isBrowsing = false);
+          break;
+        case 'invitationSent':
+        case 'invitationReceived':
+           _showStatus('$type: ${evt['displayName'] ?? evt['peerId']}');
+          break;
+        case 'error':
+          final message = evt['message'] as String? ?? 'Unknown';
+          if (message.contains('Already advertising')) {
+            setState(() => _isAdvertising = true);
+          } else if (message.contains('Already discovering')) {
+            setState(() => _isBrowsing = true);
+          }
+          if(mounted) _showStatus('Hata: $message');
+          break;
+        default:
       }
     }, onError: (err) {
       debugPrint('Event stream error: $err');
@@ -246,15 +258,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _startAdvertising() async {
-    if (_isAdvertising || _buttonLocked) {
-      _showStatus('Zaten görünürsün veya işlem bekliyor.');
-      return;
-    }
+    if (_isAdvertising || _buttonLocked) return;
     _lockButtonTemporarily();
-    setState(() => _isAdvertising = true); // optimistic UI
+    setState(() => _isAdvertising = true);
     try {
-      await _methodChannel.invokeMethod('startAdvertising', {'displayName': _localName, 'serviceType': 'mpconn'});
-      // actual started event handled via EventChannel
+      await _methodChannel.invokeMethod('startAdvertising', {'displayName': _localName});
     } catch (e) {
       setState(() => _isAdvertising = false);
       _showStatus('Advertise error: $e');
@@ -266,22 +274,19 @@ class _HomePageState extends State<HomePage> {
     _lockButtonTemporarily();
     setState(() => _isBrowsing = true);
     try {
-      await _methodChannel.invokeMethod('startBrowsing', {'displayName': _localName, 'serviceType': 'mpconn'});
+      await _methodChannel.invokeMethod('startBrowsing');
     } catch (e) {
       setState(() => _isBrowsing = false);
       _showStatus('Browsing error: $e');
     }
   }
-
+  
   Future<void> _startBoth() async {
-    if (_isAdvertising || _isBrowsing || _buttonLocked) {
-      _showStatus('Zaten bir işlem çalışıyor.');
-      return;
-    }
+    if ((_isAdvertising && _isBrowsing) || _buttonLocked) return;
     _lockButtonTemporarily();
     setState(() { _isAdvertising = true; _isBrowsing = true; });
     try {
-      await _methodChannel.invokeMethod('startBoth', {'displayName': _localName, 'serviceType': 'mpconn'});
+      await _methodChannel.invokeMethod('startBoth', {'displayName': _localName});
     } catch (e) {
       setState(() { _isAdvertising = false; _isBrowsing = false; });
       _showStatus('Both start error: $e');
@@ -289,25 +294,16 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _invitePeer(Peer peer) {
-    // Gönder: native taraf browser.invitePeer tetikler
-    MultipeerService.invitePeer(peer.id).then((_) {
-      _showStatus('Davet gönderildi: ${peer.name}');
-    }).catchError((e) {
-      _showStatus('Davet gönderme hatası: $e');
-    });
+    MultipeerService.invitePeer(peer.id)
+        .then((_) => _showStatus('Davet gönderildi: ${peer.name}'))
+        .catchError((e) => _showStatus('Davet gönderme hatası: $e'));
   }
 
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return _showStatus('Mesaj boş.');
     try {
-      // Use MeshService to create message with TTL/priority and let overlay forward
-      await MeshService().createAndSendMessage(
-        text,
-        dst: 'BROADCAST',
-        ttl: 5,
-        priority: 5,
-      );
+      await MeshService().createAndSendMessage(text, dst: 'BROADCAST');
       _messageController.clear();
       _showStatus('Mesh üzerinden gönderildi');
     } catch (e) {
@@ -329,20 +325,28 @@ class _HomePageState extends State<HomePage> {
         child: _initializing
             ? const Center(child: CircularProgressIndicator())
             : Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-                  ElevatedButton(
-                    onPressed: _isAdvertising || _buttonLocked ? null : _startAdvertising,
-                    child: const Text('Görünür Ol (Host)'),
-                  ),
-                  ElevatedButton(
-                    onPressed: _isBrowsing || _buttonLocked ? null : _startBrowsing,
-                    child: const Text('Cihaz Ara (Guest)'),
-                  ),
-                  ElevatedButton(
-                    onPressed: (_isAdvertising || _isBrowsing || _buttonLocked) ? null : _startBoth,
-                    child: const Text('Hem Ara Hem Görünür Ol'),
-                  ),
-                ]),
+                // *** DÜZELTİLMİŞ KISIM BURASI ***
+                // Row yerine Wrap kullanıldı.
+                Wrap(
+                  spacing: 8.0, // Butonlar arası yatay boşluk
+                  runSpacing: 4.0, // Butonlar alt satıra geçerse aradaki dikey boşluk
+                  alignment: WrapAlignment.center,
+                  children: [
+                    ElevatedButton(
+                      onPressed: _isAdvertising || _buttonLocked ? null : _startAdvertising,
+                      child: const Text('Görünür Ol'),
+                    ),
+                    ElevatedButton(
+                      onPressed: _isBrowsing || _buttonLocked ? null : _startBrowsing,
+                      child: const Text('Cihaz Ara'),
+                    ),
+                    ElevatedButton(
+                      onPressed: (_isAdvertising && _isBrowsing || _buttonLocked) ? null : _startBoth,
+                      child: const Text('İkisini de Yap'),
+                    ),
+                  ],
+                ),
+                // *** DÜZELTİLMİŞ KISIM BİTTİ ***
                 const SizedBox(height: 20),
                 Text(
                   connectedPeerId != null ? 'BAĞLANDI: $connectedPeerId' : 'BAĞLANTI YOK',
